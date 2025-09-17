@@ -1,31 +1,47 @@
 // api/asr.js
-// Vercel Serverless Function: transcribe (same language) or translate (to English) using Whisper
+import Busboy from "busboy";
+import FormData from "form-data";
+import fetch from "node-fetch";
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      res.status(405).send("Use POST with raw audio/video bytes");
-      return;
-    }
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Collect raw bytes from the request
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const raw = Buffer.concat(chunks);
+    // Parse multipart/form-data to get the uploaded file buffer
+    const { fileBuffer, filename } = await new Promise((resolve, reject) => {
+      const busboy = Busboy({ headers: req.headers });
+      let chunks = [];
+      let gotFile = false;
+      let fname = "audio";
 
-    // Options via headers (keeps the body just the file)
-    const task = (req.headers["x-task"] || "transcribe").toString(); // "transcribe" | "translate"
-    const language = (req.headers["x-language"] || "").toString();   // e.g., "ar"
+      busboy.on("file", (_name, file, info) => {
+        gotFile = true;
+        if (info && info.filename) fname = info.filename;
+        file.on("data", (d) => chunks.push(d));
+        file.on("end", () => {});
+      });
+
+      busboy.on("finish", () => {
+        if (!gotFile) return reject(new Error("No file field in form-data"));
+        resolve({ fileBuffer: Buffer.concat(chunks), filename: fname });
+      });
+
+      busboy.on("error", reject);
+      req.pipe(busboy);
+    });
+
+    // Read control headers (sent by the Action)
+    const task = (req.headers["x-task"] || "transcribe").toString(); // transcribe | translate
+    const language = (req.headers["x-language"] || "").toString();
     const wantSrt = ((req.headers["x-want-srt"] || "false").toString() === "true");
 
-    // Build multipart form for OpenAI
+    // Build OpenAI request
     const form = new FormData();
-    form.append("file", new Blob([raw]), "audio");
+    form.append("file", fileBuffer, { filename });
     form.append("model", "whisper-1");
     if (language) form.append("language", language);
 
     const endpoint = task === "translate" ? "translations" : "transcriptions";
-
     const r = await fetch(`https://api.openai.com/v1/audio/${endpoint}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -33,7 +49,7 @@ module.exports = async (req, res) => {
     });
     const data = await r.json();
 
-    // Build very simple SRT from segments (if present)
+    // Optional SRT from segments
     const toSrt = (segments = []) =>
       segments.map((s, i) => {
         const fmt = (t) => {
@@ -56,4 +72,7 @@ module.exports = async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e?.message || "Unknown error" });
   }
-};
+}
+
+// Vercel (Node) should not auto-parse the body for this route
+export const config = { api: { bodyParser: false } };
