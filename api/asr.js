@@ -3,43 +3,43 @@ import FormData from "form-data";
 import fetch from "node-fetch";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).send("Method Not Allowed");
-    return;
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    const { fileBuffer, filename } = await new Promise((resolve, reject) => {
-      const busboy = Busboy({ headers: req.headers });
-      let chunks = [];
-      let fname = "upload.wav";
+    const state = { chunks: [], filename: "upload.wav", task: "transcribe", language: "", wantSrt: false };
 
-      busboy.on("file", (_field, file, info) => {
-        if (info && info.filename) fname = info.filename;
-        file.on("data", (d) => chunks.push(d));
+    await new Promise((resolve, reject) => {
+      const bb = Busboy({ headers: req.headers });
+
+      bb.on("file", (fieldname, file, info) => {
+        if (info?.filename) state.filename = info.filename;
+        file.on("data", d => state.chunks.push(d));
         file.on("end", () => {});
       });
 
-      busboy.on("finish", () => {
-        if (!chunks.length) return reject(new Error("No file uploaded"));
-        resolve({ fileBuffer: Buffer.concat(chunks), filename: fname });
+      bb.on("field", (name, value) => {
+        if (name === "task" && (value === "transcribe" || value === "translate")) state.task = value;
+        if (name === "language") state.language = String(value || "");
+        if (name === "wantSrt") state.wantSrt = String(value).toLowerCase() === "true";
       });
 
-      busboy.on("error", reject);
-      req.pipe(busboy);
+      bb.on("finish", () => {
+        if (!state.chunks.length) return reject(new Error("No file uploaded"));
+        resolve();
+      });
+
+      bb.on("error", reject);
+      req.pipe(bb);
     });
 
-    const task = (req.headers["x-task"] || "transcribe").toString(); // "transcribe" | "translate"
-    const language = (req.headers["x-language"] || "").toString();
-    const wantSrt = ((req.headers["x-want-srt"] || "false").toString() === "true");
+    const fileBuffer = Buffer.concat(state.chunks);
 
     const form = new FormData();
-    form.append("file", fileBuffer, { filename });
+    form.append("file", fileBuffer, { filename: state.filename });
     form.append("model", "whisper-1");
-    if (language) form.append("language", language);
+    if (state.language) form.append("language", state.language);
 
-    const endpoint = task === "translate" ? "translations" : "transcriptions";
-
+    const endpoint = state.task === "translate" ? "translations" : "transcriptions";
     const r = await fetch(`https://api.openai.com/v1/audio/${endpoint}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -55,15 +55,15 @@ export default async function handler(req, res) {
           const s2 = t % 60;
           const ms = Math.round((s2 - Math.floor(s2)) * 1000);
           const pad = (n, z = 2) => String(n).padStart(z, "0");
-          return `${pad(h)}:${pad(m)}:${pad(Math.floor(s2))},${String(ms).padStart(3,"0")}`;
+          return `${pad(h)}:${pad(m)}:${pad(Math.floor(s2))},${String(ms).padStart(3, "0")}`;
         };
-        return `${i + 1}\n${fmt(s.start)} --> ${fmt(s.end)}\n${s.text.trim()}\n`;
+        return `${i + 1}\n${fmt(s.start)} --> ${fmt(s.end)}\n${(s.text || "").trim()}\n`;
       }).join("\n");
 
     res.status(200).json({
-      task,
+      task: state.task,
       text: data.text,
-      srt: wantSrt && Array.isArray(data.segments) ? toSrt(data.segments) : undefined,
+      srt: state.wantSrt && Array.isArray(data.segments) ? toSrt(data.segments) : undefined,
       segments: data.segments
     });
   } catch (err) {
@@ -71,5 +71,5 @@ export default async function handler(req, res) {
   }
 }
 
-// Tell Vercel not to pre-parse the body
+// Important for multipart parsing on Vercel
 export const config = { api: { bodyParser: false } };
